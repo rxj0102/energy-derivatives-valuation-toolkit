@@ -1,5 +1,7 @@
 # Energy Derivatives Valuation Toolkit
 
+[![CI](https://github.com/rxj0102/energy-derivatives-valuation-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/rxj0102/energy-derivatives-valuation-toolkit/actions/workflows/ci.yml)
+
 A small, self-contained Python toolkit that simulates wholesale electricity
 and natural gas prices and uses that simulation to price energy derivatives
 and value two common power-market assets: a gas-fired "tolling agreement"
