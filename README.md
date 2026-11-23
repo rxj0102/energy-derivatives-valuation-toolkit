@@ -109,7 +109,7 @@ energy_toolkit/
     battery_storage_optionality.py  # battery storage valuation via Longstaff-Schwartz
     model_calibration_validation.py # moment-matching calibration + backtesting
     risk_report.py                  # portfolio VaR/CVaR report
-tests/                               # pytest suite (44 tests)
+tests/                               # pytest suite (46 tests)
 ```
 
 ### Module-by-module
@@ -147,9 +147,15 @@ lognormal option formula on a spiky, mean-reverting underlying).
 
 **`generation_asset_valuation.py`**: values a synthetic gas plant tolling
 agreement as a strip of daily spark-spread options with a monthly
-start-count limit and a minimum-run-time constraint, solved exactly via a
-small dynamic program (per month, per simulated path) and averaged across
-Monte Carlo paths.
+start-count limit and a minimum-run-time constraint. The reported value
+follows a non-anticipative start rule learned by Longstaff-Schwartz
+regression on the day's spark spread, cross-fitted so that each path is
+valued by a rule fitted on the other half of the paths. The exact monthly
+dynamic program, which knows the whole month's prices in advance, is kept
+as `perfect_foresight_value`, an upper bound. With the quick start settings
+below (1,000 paths, 5 years, 8 one-day starts a month) the policy is worth
+$41.6M (standard error $0.17M) against $48.2M with perfect foresight, so
+foresight overstates the value by about 16%.
 
 **`battery_storage_optionality.py`**: values a battery via a
 Longstaff-Schwartz / Least-Squares Monte Carlo approach adapted to storage
@@ -186,10 +192,10 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The suite (44 tests) covers: price process statistical properties
+The suite (46 tests) covers: price process statistical properties
 (seasonality, mean reversion, jump clustering, skewness), Black-76 vs.
 Monte Carlo convergence and put-call parity, Margrabe/Kirk vs. Monte Carlo
-convergence for spread options, dispatch-DP correctness (cross-checked
+convergence for spread options, the tolling policy (feasible, so never above perfect foresight, and equal to the daily strip without constraints), dispatch-DP correctness (cross-checked
 against brute force), LSM convergence for the battery, and VaR/CVaR
 correctness (including a check against the analytic normal-distribution
 quantile). It runs in well under a minute.
@@ -269,7 +275,7 @@ uv run pytest -q   # runs the test suite
 
 ### Runtime
 
-The test suite (44 tests) finishes in about 27 seconds on the machine above, including any data downloads it triggers.
+The test suite (46 tests) finishes in about 27 seconds on the machine above, including any data downloads it triggers.
 
 ### Citation
 
