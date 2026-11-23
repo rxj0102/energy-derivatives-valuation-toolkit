@@ -17,13 +17,20 @@ economics) and, once started, it must run for a minimum number of days
 before it can shut down again (``min_run_days``, a simple stand-in for
 ramp / minimum-up-time constraints).
 
-Optimal dispatch under those constraints is solved exactly, month by month,
-with a small dynamic program: choose up to ``max_starts_per_month``
-non-overlapping ``min_run_days``-length "runs" within the month to maximize
-total discounted spread revenue net of start costs. This is the "optimal
-dispatch decision simulated each day" real-options valuation: it is run
-independently along each Monte Carlo price path, and the plant's value is
-the discounted expected value across paths.
+Two values are reported.
+
+* ``mean_value`` (the headline) follows a non-anticipative policy: on each day
+  the holder decides whether to start a run knowing only prices up to that day.
+  The start rule is learned by Longstaff-Schwartz regression of the realised
+  gain from starting now over waiting, on a polynomial in the day's spark
+  spread, separately for each day of the month and number of starts left. The
+  paths are split in two halves; the rule fitted on one half is applied to the
+  other (cross-fitting), so every path value is out of sample and the result is
+  a lower bound on the true option value, up to Monte Carlo error.
+* ``perfect_foresight_value`` solves the month exactly with a dynamic program
+  along each path, choosing up to ``max_starts_per_month`` non-overlapping
+  ``min_run_days``-length runs with the whole month's prices known in advance.
+  That uses future information, so it is an upper bound, not a price.
 
 DISCLAIMER: synthetic data / educational purposes only, see
 ``power_price_model.py``.
@@ -134,17 +141,76 @@ def optimal_monthly_dispatch(
     return mask, float(dp[0, K])
 
 
+def _basis(x: np.ndarray) -> np.ndarray:
+    z = x / (np.std(x) + 1e-12)
+    return np.column_stack([np.ones_like(z), z, z**2, z**3])
+
+
+def _fit_start_rules(
+    spread_dollars: np.ndarray, start_cost_disc: np.ndarray, spread: np.ndarray, K: int, L: int
+) -> dict:
+    """Regression coefficients of (value of starting today - value of waiting) on the
+    day's spread, for every (day, starts left), by backward induction on the given paths.
+    """
+    n_paths, n = spread_dollars.shape
+    prefix = np.concatenate([np.zeros((n_paths, 1)), np.cumsum(spread_dollars, axis=1)], axis=1)
+    V = np.zeros((n + 1, K + 1, n_paths))  # realised value from day d with k starts left
+    coefs: dict = {}
+    for d in range(n - 1, -1, -1):
+        V[d, 0] = V[d + 1, 0]
+        X = _basis(spread[:, d])
+        for k in range(1, K + 1):
+            skip = V[d + 1, k]
+            if d + L > n:
+                V[d, k] = skip
+                continue
+            run = prefix[:, d + L] - prefix[:, d] - start_cost_disc[d]
+            start = run + V[d + L, k - 1]
+            beta, *_ = np.linalg.lstsq(X, start - skip, rcond=None)
+            coefs[(d, k)] = beta
+            go = X @ beta > 0.0
+            V[d, k] = np.where(go, start, skip)
+    return coefs
+
+
+def _apply_start_rules(
+    spread_dollars: np.ndarray, start_cost_disc: np.ndarray, spread: np.ndarray,
+    coefs: dict, K: int, L: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run the learned rule forward on new paths. Returns (value, starts) per path."""
+    n_paths, n = spread_dollars.shape
+    value = np.zeros(n_paths)
+    starts = np.zeros(n_paths)
+    k = np.full(n_paths, K)
+    busy_until = np.zeros(n_paths, dtype=int)
+    for d in range(n):
+        if d + L > n:
+            break
+        X = _basis(spread[:, d])
+        for kk in range(1, K + 1):
+            beta = coefs.get((d, kk))
+            if beta is None:
+                continue
+            idx = (k == kk) & (busy_until <= d) & (X @ beta > 0.0)
+            if not idx.any():
+                continue
+            value[idx] += spread_dollars[idx, d : d + L].sum(axis=1) - start_cost_disc[d]
+            starts[idx] += 1
+            k[idx] -= 1
+            busy_until[idx] = d + L
+    return value, starts
+
+
 def value_tolling_agreement(
     scenario: PriceScenario, spec: TollingAgreementSpec, r: float
 ) -> dict:
     """Monte Carlo value of the tolling agreement across all paths in ``scenario``.
 
-    For each path, spread is computed daily, split by calendar month, and
-    the exact optimal-dispatch DP is applied within each month. Path values
-    are then averaged (with a standard error) to give the constrained
-    agreement value, alongside an unconstrained baseline (sum of all
-    positive daily spreads, i.e. a plain strip of daily spark-spread calls
-    with no start/ramp restrictions) for comparison.
+    ``mean_value`` and ``path_values`` come from the cross-fitted non-anticipative
+    policy (see the module docstring). ``perfect_foresight_value`` is the exact
+    monthly dynamic program run with the month's prices known in advance, an
+    upper bound. ``unconstrained_intrinsic_value`` is a strip of daily spark-spread
+    calls with no start or run limits.
     """
     n_paths = scenario.n_paths
     dt = scenario.dt_years
@@ -159,7 +225,7 @@ def value_tolling_agreement(
             month_boundaries.append((start, i))
             start = i
 
-    constrained_values = np.zeros(n_paths)
+    constrained_values = np.zeros(n_paths)  # perfect foresight, per path
     unconstrained_values = np.zeros(n_paths)
     n_starts_used = np.zeros(n_paths)
 
@@ -189,14 +255,40 @@ def value_tolling_agreement(
         constrained_values[p] = total_value
         n_starts_used[p] = starts
 
-    mean_value = float(constrained_values.mean())
-    std_error = float(constrained_values.std(ddof=1) / np.sqrt(n_paths)) if n_paths > 1 else 0.0
+    # Non-anticipative policy, cross-fitted: rules learned on one half of the paths
+    # are applied to the other half, so every path value is out of sample.
+    K, L = spec.max_starts_per_month, spec.min_run_days
+    all_spread = np.stack(
+        [
+            daily_spark_spread(scenario.power_prices[p], scenario.gas_prices[p], spec.heat_rate, spec.variable_om_cost)
+            for p in range(n_paths)
+        ]
+    )
+    dollars = all_spread * spec.capacity_mw * spec.hours_per_day * disc_factors
+    halves = [np.arange(0, n_paths, 2), np.arange(1, n_paths, 2)]
+    if n_paths < 2:
+        halves = [np.arange(n_paths), np.arange(n_paths)]
+    policy_values = np.zeros(n_paths)
+    policy_starts = np.zeros(n_paths)
+    for fit_idx, eval_idx in ((halves[0], halves[1]), (halves[1], halves[0])):
+        if len(eval_idx) == 0:
+            continue
+        for (m_start, m_end) in month_boundaries:
+            sl = slice(m_start, m_end)
+            sc = spec.start_cost * disc_factors[sl]
+            coefs = _fit_start_rules(dollars[fit_idx][:, sl], sc, all_spread[fit_idx][:, sl], K, L)
+            v, st = _apply_start_rules(dollars[eval_idx][:, sl], sc, all_spread[eval_idx][:, sl], coefs, K, L)
+            policy_values[eval_idx] += v
+            policy_starts[eval_idx] += st
 
+    se = lambda x: float(x.std(ddof=1) / np.sqrt(len(x))) if len(x) > 1 else 0.0
     return {
-        "mean_value": mean_value,
-        "std_error": std_error,
-        "path_values": constrained_values,
+        "mean_value": float(policy_values.mean()),
+        "std_error": se(policy_values),
+        "path_values": policy_values,
+        "perfect_foresight_value": float(constrained_values.mean()),
+        "perfect_foresight_std_error": se(constrained_values),
         "unconstrained_intrinsic_value": float(unconstrained_values.mean()),
-        "mean_starts_per_path": float(n_starts_used.mean()),
+        "mean_starts_per_path": float(policy_starts.mean()),
         "n_months": len(month_boundaries),
     }

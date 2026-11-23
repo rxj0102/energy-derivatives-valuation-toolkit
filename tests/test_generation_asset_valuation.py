@@ -78,3 +78,22 @@ def test_value_tolling_agreement_output_structure(small_scenario):
     assert result["std_error"] >= 0
     assert len(result["path_values"]) == small_scenario.n_paths
     assert result["n_months"] == 12
+
+
+def test_policy_is_feasible_so_never_beats_perfect_foresight(small_scenario):
+    spec = TollingAgreementSpec(capacity_mw=50, max_starts_per_month=3, min_run_days=2)
+    result = value_tolling_agreement(small_scenario, spec, r=0.04)
+    assert result["mean_value"] <= result["perfect_foresight_value"] + 1e-6
+    assert result["mean_value"] > 0
+
+
+def test_policy_recovers_daily_strip_without_constraints(small_scenario):
+    """One-day runs, a start every day and no start cost: each day is a separate call
+    exercised on that day's spread, so the policy needs no foresight."""
+    spec = TollingAgreementSpec(
+        capacity_mw=50, max_starts_per_month=31, min_run_days=1, start_cost=0.0
+    )
+    result = value_tolling_agreement(small_scenario, spec, r=0.04)
+    assert abs(result["mean_value"] - result["unconstrained_intrinsic_value"]) <= 0.02 * result[
+        "unconstrained_intrinsic_value"
+    ]
